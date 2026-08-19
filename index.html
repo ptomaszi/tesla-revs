@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<title>Revs</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; overflow:hidden; background:#000; color:#fff;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent; }
+  #app { height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; }
+  #speed { font-size:min(44vw,58vh); line-height:0.86; font-weight:700;
+    letter-spacing:-0.05em; font-variant-numeric:tabular-nums; }
+  #unit { font-size:min(7vw,9vh); letter-spacing:0.35em; opacity:0.4; margin-top:1vh; }
+  #status { position:fixed; bottom:2.5vh; left:0; right:0; text-align:center;
+    font-size:2.2vh; letter-spacing:0.18em; opacity:0.3; }
+  #start { position:fixed; inset:0; background:#000; cursor:pointer;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4vh; }
+  #start h1 { font-size:9vh; font-weight:700; letter-spacing:0.12em; }
+  #start p { font-size:2.8vh; line-height:1.7; opacity:0.5; text-align:center; max-width:60vw; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="speed">0</div>
+  <div id="unit">MPH</div>
+</div>
+<div id="status">idle</div>
+<div id="start"><h1>REVS</h1><p>Tap to start.<br>Allow location access.</p></div>
+<script>
+const MPS_TO_MPH = 2.236936;
+const GEARS = [470, 282, 201, 148, 117, 94];
+const IDLE_RPM = 850, MAX_RPM = 6800, UPSHIFT = 6300, DOWNSHIFT = 2400;
+const SHIFT_CUT = 0.13;
+
+const params = new URLSearchParams(location.search);
+const SIM = params.has('sim');
+
+let target = 0, display = 0, accel = 0, gear = 0, rpm = IDLE_RPM;
+let cut = 0, simInput = 0, lastFix = null, lastFrame = 0;
+
+function haversine(a, b) {
+  const R = 6371000, rad = Math.PI / 180;
+  const dLat = (b.latitude - a.latitude) * rad, dLon = (b.longitude - a.longitude) * rad;
+  const la1 = a.latitude * rad, la2 = b.latitude * rad;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function gearFor(mps, g) {
+  const at = i => Math.min(MAX_RPM, Math.max(IDLE_RPM, mps * GEARS[i]));
+  const r = at(g);
+  if (r > UPSHIFT && g < GEARS.length - 1) g++;
+  else if (r < DOWNSHIFT && g > 0) g--;
+  return { gear: g, rpm: at(g) };
+}
+
+function status(text) { document.getElementById('status').textContent = text; }
+
+function onFix(pos) {
+  const c = pos.coords;
+  let s = (typeof c.speed === 'number' && c.speed >= 0 && isFinite(c.speed)) ? c.speed : null;
+  if (s === null && lastFix) {
+    const dt = (pos.timestamp - lastFix.timestamp) / 1000;
+    if (dt > 0.2 && dt < 10) s = haversine(lastFix.coords, c) / dt;
+  }
+  lastFix = pos;
+  if (s === null) { status('no speed from gps'); return; }
+  target += (s - target) * 0.55;
+  status('gps ' + Math.round(c.accuracy) + 'm');
+}
+
+function onGeoError(err) { status('gps error: ' + err.message.toLowerCase()); }
+
+let ctx, master, lowpass, noiseGain, oscs = [];
+
+function initAudio() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  ctx = new AC();
+  master = ctx.createGain();
+  master.gain.value = 0.0001;
+  master.connect(ctx.destination);
+  lowpass = ctx.createBiquadFilter();
+  lowpass.type = 'lowpass';
+  lowpass.frequency.value = 500;
+  lowpass.Q.value = 0.9;
+  lowpass.connect(master);
+  const specs = [[0.5, 0.30, 'sawtooth', -7], [1, 1.0, 'sawtooth', 0],
+                 [2, 0.42, 'square', 6], [3, 0.18, 'sawtooth', -11]];
+  for (const [mult, g, type, det] of specs) {
+    const o = ctx.createOscillator();
+    o.type = type;
+    o.detune.value = det;
+    const gn = ctx.createGain();
+    gn.gain.value = g * 0.16;
+    o.connect(gn); gn.connect(lowpass); o.start();
+    oscs.push({ o, mult });
+  }
+  const len = Math.floor(ctx.sampleRate * 2);
+  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+  const noise = ctx.createBufferSource();
+  noise.buffer = buf; noise.loop = true;
+  const bp = ctx.createBiquadFilter();
+  bp.type = 'bandpass'; bp.frequency.value = 950; bp.Q.value = 0.7;
+  noiseGain = ctx.createGain();
+  noiseGain.gain.value = 0.0001;
+  noise.connect(bp); bp.connect(noiseGain); noiseGain.connect(master); noise.start();
+}
+
+function updateAudio() {
+  if (!ctx) return;
+  const t = ctx.currentTime + 0.02;
+  const fire = rpm / 30;
+  for (const s of oscs) s.o.frequency.setTargetAtTime(fire * s.mult, t, 0.035);
+  const revs = (rpm - IDLE_RPM) / (MAX_RPM - IDLE_RPM);
+  let load = Math.min(1, Math.max(0.05, (accel + 0.35) / 2.2));
+  if (cut > 0) load *= 0.15;
+  lowpass.frequency.setTargetAtTime(380 + 2500 * load + 1400 * revs, t, 0.07);
+  master.gain.setTargetAtTime(0.09 + 0.30 * load + 0.13 * revs, t, 0.05);
+  noiseGain.gain.setTargetAtTime(0.015 + 0.09 * load * revs, t, 0.07);
+}
+
+function frame(now) {
+  const dt = Math.min(0.1, (now - lastFrame) / 1000) || 0.016;
+  lastFrame = now;
+  if (SIM) {
+    const rate = simInput > 0 ? 2.8 : simInput < 0 ? -6 : -0.8;
+    target = Math.max(0, target + rate * dt);
+  }
+  const prev = display;
+  display += (target - display) * (1 - Math.exp(-dt / 0.45));
+  const raw = (display - prev) / dt;
+  accel += (Math.min(6, Math.max(-8, raw)) - accel) * (1 - Math.exp(-dt / 0.25));
+  const next = gearFor(Math.max(0, display), gear);
+  if (next.gear !== gear) cut = SHIFT_CUT;
+  gear = next.gear;
+  rpm = next.rpm;
+  cut = Math.max(0, cut - dt);
+  updateAudio();
+  document.getElementById('speed').textContent = Math.round(display * MPS_TO_MPH);
+  requestAnimationFrame(frame);
+}
+
+function start() {
+  document.getElementById('start').classList.add('hidden');
+  try { initAudio(); ctx.resume(); } catch (e) { status('audio unavailable'); }
+  if (SIM) {
+    status('sim: hold up / down arrow');
+    addEventListener('keydown', e => {
+      if (e.key === 'ArrowUp') simInput = 1;
+      else if (e.key === 'ArrowDown') simInput = -1;
+    });
+    addEventListener('keyup', e => {
+      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') simInput = 0;
+    });
+  } else if (navigator.geolocation) {
+    status('waiting for gps');
+    navigator.geolocation.watchPosition(onFix, onGeoError,
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
+  } else {
+    status('no geolocation on this browser');
+  }
+  lastFrame = performance.now();
+  requestAnimationFrame(frame);
+}
+
+function selfTest() {
+  const pass = [], fail = [];
+  const t = (name, cond) => (cond ? pass : fail).push(name);
+  t('idle floor at standstill', gearFor(0, 0).rpm === IDLE_RPM);
+  t('stays in first while slow', gearFor(5, 0).gear === 0 && gearFor(5, 0).rpm > 2000);
+  t('upshifts past redline', gearFor(14, 0).gear === 1);
+  t('downshifts when bogging', gearFor(4, 3).gear === 2);
+  t('rpm never exceeds max', gearFor(200, 5).rpm <= MAX_RPM);
+  t('ratchets to top gear', (() => {
+    let g = 0;
+    for (let s = 0; s < 70; s += 0.5) g = gearFor(s, g).gear;
+    return g === GEARS.length - 1;
+  })());
+  t('one degree of latitude is ~111km',
+    Math.abs(haversine({ latitude: 0, longitude: 0 }, { latitude: 1, longitude: 0 }) - 111195) < 200);
+  t('same point is zero distance',
+    haversine({ latitude: 52.57, longitude: -0.24 }, { latitude: 52.57, longitude: -0.24 }) === 0);
+  console.log('pass ' + pass.length + '/' + (pass.length + fail.length), pass);
+  if (fail.length) console.error('FAIL', fail);
+  document.body.textContent = fail.length
+    ? 'FAIL: ' + fail.join(' | ')
+    : 'all ' + pass.length + ' checks pass';
+  document.body.style.cssText = 'padding:4vh;font-size:3vh;line-height:1.6';
+}
+
+if (params.has('test')) selfTest();
+else document.getElementById('start').addEventListener('click', start, { once: true });
+</script>
+</body>
+</html>
